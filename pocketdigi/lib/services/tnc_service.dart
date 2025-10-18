@@ -3,7 +3,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 import 'package:flutter_bluetooth_serial/flutter_bluetooth_serial.dart';
-import 'package:shared_preferences/shared_preferences.dart'; // <-- ADD THIS
+import 'package:shared_preferences/shared_preferences.dart';
 import 'aprs_parser.dart';
 
 // KISS Protocol Constants
@@ -12,6 +12,16 @@ const int FESC = 0xDB; // Frame Escape
 const int TFEND = 0xDC; // Transposed Frame End
 const int TFESC = 0xDD; // Transposed Frame Escape
 const int KISS_CMD_DATA = 0x00;
+
+/// Differentiates where a transmitted packet came from.
+enum PacketSource { digipeat, iGate, beacon }
+
+/// Simple class to bundle a transmitted packet with its source.
+class TransmittedPacket {
+  final AprsPacket packet;
+  final PacketSource source;
+  TransmittedPacket(this.packet, this.source);
+}
 
 class TncService {
   // --- Private State ---
@@ -23,30 +33,30 @@ class TncService {
   String _myCallsign = 'N0CALL';
   int _mySSID = 1;
   bool _isDigipeaterEnabled = true;
-  static const _callsignPrefKey = 'user_callsign'; // <-- ADD THIS
+  static const _callsignPrefKey = 'user_callsign';
 
-  // --- Stream Controllers for UI Communication ---
+  // --- Stream Controllers ---
   final _systemLogController = StreamController<String>.broadcast();
   final _rxPacketLogController = StreamController<AprsPacket>.broadcast();
-  final _txPacketLogController = StreamController<AprsPacket>.broadcast();
+  final _txPacketLogController = StreamController<TransmittedPacket>.broadcast();
   final _connectionStatusController = StreamController<bool>.broadcast();
   final _deviceListController = StreamController<List<BluetoothDevice>>.broadcast();
   final _isScanningController = StreamController<bool>.broadcast();
-  final _initialCallsignController = StreamController<String>.broadcast(); // <-- ADD THIS
+  final _initialCallsignController = StreamController<String>.broadcast();
 
-  // --- Public Streams for the UI to consume ---
+  // --- Public Streams ---
   Stream<String> get systemLogs => _systemLogController.stream;
   Stream<AprsPacket> get rxPacketLogs => _rxPacketLogController.stream;
-  Stream<AprsPacket> get txPacketLogs => _txPacketLogController.stream;
+  Stream<TransmittedPacket> get txPacketLogs => _txPacketLogController.stream;
   Stream<bool> get isConnectedStream => _connectionStatusController.stream;
   Stream<List<BluetoothDevice>> get deviceStream => _deviceListController.stream;
   Stream<bool> get isScanningStream => _isScanningController.stream;
-  Stream<String> get initialCallsign => _initialCallsignController.stream; // <-- ADD THIS
+  Stream<String> get initialCallsign => _initialCallsignController.stream;
 
   TncService() {
     _connectionStatusController.add(false);
     _isScanningController.add(false);
-    _loadCallsign(); // <-- ADD THIS
+    _loadCallsign();
   }
 
   // --- SharedPreferences Logic ---
@@ -54,14 +64,13 @@ class TncService {
     final prefs = await SharedPreferences.getInstance();
     final callsign = prefs.getString(_callsignPrefKey) ?? 'N0CALL-1';
     setCallsign(callsign);
-    _initialCallsignController.add(callsign); // Notify UI of loaded callsign
+    _initialCallsignController.add(callsign);
   }
 
   Future<void> _saveCallsign(String callsignSsid) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_callsignPrefKey, callsignSsid);
   }
-  // --- End SharedPreferences ---
 
   // --- Public Configuration Methods ---
   void setCallsign(String callsignSsid) {
@@ -73,17 +82,16 @@ class TncService {
       _myCallsign = callsignSsid.toUpperCase();
       _mySSID = 0;
     }
-    _saveCallsign(callsignSsid); // Save on every change
+    _saveCallsign(callsignSsid);
     _systemLogController.add('Callsign set to $_myCallsign-$_mySSID');
   }
 
   void setDigipeaterEnabled(bool enabled) {
     _isDigipeaterEnabled = enabled;
-    _systemLogController
-        .add('Digipeater ${enabled ? "enabled" : "disabled"}.');
+    _systemLogController.add('Digipeater ${enabled ? "enabled" : "disabled"}.');
   }
 
-  // --- Connection Methods (No changes here) ---
+  // --- Connection Methods ---
   Future<void> getPairedDevices() async {
     _isScanningController.add(true);
     _systemLogController.add('Scanning for paired devices...');
@@ -134,7 +142,7 @@ class TncService {
     if (!remote) _systemLogController.add('Connection closed.');
   }
 
-  // --- Data Processing and Logic (No changes here) ---
+  // --- Data Processing and Logic ---
   void _onDataReceived(Uint8List data) {
     _buffer.addAll(data);
     _processBuffer();
@@ -144,10 +152,10 @@ class TncService {
     while (_buffer.contains(FEND)) {
       int frameStartIndex = _buffer.indexOf(FEND);
       if (frameStartIndex > 0) _buffer.removeRange(0, frameStartIndex);
-      _buffer.removeAt(0); // Start FEND
+      _buffer.removeAt(0);
       int frameEndIndex = _buffer.indexOf(FEND);
       if (frameEndIndex == -1) {
-        _buffer.insert(0, FEND); // Incomplete frame
+        _buffer.insert(0, FEND);
         break;
       }
       Uint8List rawFrame = Uint8List.fromList(_buffer.sublist(0, frameEndIndex));
@@ -159,8 +167,8 @@ class TncService {
         Uint8List ax25Frame = _unescapeKISS(rawFrame.sublist(1));
         AprsPacket? packet = AprsParser.parse(ax25Frame);
         if (packet != null) {
-          _rxPacketLogController.add(packet); // Log RX
-          _processDigipeat(packet); // Check if we should digipeat it
+          _rxPacketLogController.add(packet);
+          _processDigipeat(packet);
         }
       }
     }
@@ -168,36 +176,30 @@ class TncService {
 
   void _processDigipeat(AprsPacket packet) {
     if (!_isDigipeaterEnabled) return;
-    if (packet.source.callsign == _myCallsign) return; // Don't digi our own
+    if (packet.source.callsign == _myCallsign) return;
 
     List<Ax25Address> newPath = [];
     bool pathModified = false;
     bool foundMyCallsign = false;
 
-    // Iterate the path to find the next "hop"
     for (int i = 0; i < packet.path.length; i++) {
       Ax25Address hop = packet.path[i];
-      newPath.add(hop); // Add the hop to the new path
+      newPath.add(hop);
 
       if (hop.callsign == _myCallsign) {
         foundMyCallsign = true;
       }
 
-      // If this hop hasn't been used yet and we haven't already modified the path...
       if (!hop.hasBeenDigipeated && !pathModified) {
-        // WIDE1-1: Just mark as used and insert our callsign
         if (hop.matches('WIDE1-1')) {
           hop.hasBeenDigipeated = true;
-          // Insert our callsign *after* this hop
           newPath.add(Ax25Address(
             callsign: _myCallsign,
             ssid: _mySSID,
             hasBeenDigipeated: true,
           ));
           pathModified = true;
-        }
-        // WIDE2-1: Same as WIDE1-1
-        else if (hop.matches('WIDE2-1')) {
+        } else if (hop.matches('WIDE2-1')) {
           hop.hasBeenDigipeated = true;
           newPath.add(Ax25Address(
             callsign: _myCallsign,
@@ -205,12 +207,9 @@ class TncService {
             hasBeenDigipeated: true,
           ));
           pathModified = true;
-        }
-        // WIDE2-2: Mark as used, insert our callsign, and change this hop to WIDE2-1
-        else if (hop.matches('WIDE2-2')) {
-          hop.callsign = 'WIDE2'; // Change WIDE2-2
-          hop.ssid = 1;          // to WIDE2-1
-          // Insert our callsign *before* this modified hop
+        } else if (hop.matches('WIDE2-2')) {
+          hop.callsign = 'WIDE2';
+          hop.ssid = 1;
           newPath.insert(
               newPath.length - 1,
               Ax25Address(
@@ -223,21 +222,20 @@ class TncService {
       }
     }
 
-    // If we modified the path and haven't already digipeated this packet, send it.
     if (pathModified && !foundMyCallsign) {
       AprsPacket digiPacket = AprsPacket(
         source: packet.source,
         destination: packet.destination,
         path: newPath,
         payload: packet.payload,
-        originalFrame: packet.originalFrame, // Not strictly needed for encode
+        originalFrame: packet.originalFrame,
       );
-
-      _sendPacket(digiPacket);
+      transmitPacket(digiPacket, source: PacketSource.digipeat);
     }
   }
 
-  Future<void> _sendPacket(AprsPacket packet) async {
+  /// Public method to transmit any APRS packet (from digi, igate, or beacon).
+  Future<void> transmitPacket(AprsPacket packet, {required PacketSource source}) async {
     if (_connection == null || !_connection!.isConnected) {
       _systemLogController.add('TX Error: Not connected.');
       return;
@@ -250,8 +248,7 @@ class TncService {
       _connection!.output.add(kissFrame);
       await _connection!.output.allSent;
 
-      // Log the successful transmission
-      _txPacketLogController.add(packet);
+      _txPacketLogController.add(TransmittedPacket(packet, source));
     } catch (e) {
       _systemLogController.add('TX Error: $e');
     }
@@ -273,7 +270,6 @@ class TncService {
         kissFrame.add(byte);
       }
     }
-
     kissFrame.add(FEND);
     return Uint8List.fromList(kissFrame);
   }
@@ -304,7 +300,7 @@ class TncService {
     _connectionStatusController.close();
     _deviceListController.close();
     _isScanningController.close();
-    _initialCallsignController.close(); // <-- ADD THIS
+    _initialCallsignController.close();
     disconnect();
   }
 }

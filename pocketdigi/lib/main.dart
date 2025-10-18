@@ -15,6 +15,7 @@ class PocketDigiApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'PocketDigi',
+      debugShowCheckedModeBanner: false, // <-- ADD THIS LINE TO REMOVE THE BANNER
       theme: ThemeData(
         brightness: Brightness.dark,
         primarySwatch: Colors.blue,

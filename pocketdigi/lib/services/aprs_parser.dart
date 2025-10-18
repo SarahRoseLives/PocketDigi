@@ -3,60 +3,85 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+/// Represents a 7-byte AX.25 address field.
+class Ax25Address {
+  String callsign;
+  int ssid;
+  bool hasBeenDigipeated; // The "H-bit" or "used" bit
+
+  Ax25Address({
+    required this.callsign,
+    this.ssid = 0,
+    this.hasBeenDigipeated = false,
+  });
+
+  /// Returns the standard string representation (e.g., "N0CALL-1*")
+  @override
+  String toString() {
+    String callSsid = ssid > 0 ? '$callsign-$ssid' : callsign;
+    return hasBeenDigipeated ? '$callSsid*' : callSsid;
+  }
+
+  /// Checks if this address matches a generic path (e.g., "WIDE1-1")
+  bool matches(String genericPath) {
+    if (genericPath.contains('-')) {
+      var parts = genericPath.split('-');
+      return callsign.toUpperCase() == parts[0].toUpperCase() &&
+          ssid == int.tryParse(parts[1]);
+    } else {
+      return callsign.toUpperCase() == genericPath.toUpperCase() && ssid == 0;
+    }
+  }
+}
+
 /// Represents a successfully parsed APRS packet.
 class AprsPacket {
-  final String source;
-  final String destination;
-  final List<String> path;
+  final Ax25Address source;
+  final Ax25Address destination;
+  final List<Ax25Address> path;
   final String payload;
+  final Uint8List originalFrame; // Keep original for debugging or forwarding
 
   AprsPacket({
     required this.source,
     required this.destination,
     required this.path,
     required this.payload,
+    required this.originalFrame,
   });
 
   /// Provides a human-readable representation of the packet.
   @override
   String toString() {
-    String pathString = path.join(',');
+    String pathString = path.map((p) => p.toString()).join(',');
     return '$source>$destination,$pathString:$payload';
   }
 }
 
-/// A utility class for parsing raw AX.25 frames into APRS packets.
+/// A utility class for parsing AND encoding raw AX.25 frames.
 class AprsParser {
-  /// Parses a raw AX.25 byte frame (the payload of a KISS data frame).
-  /// Returns an [AprsPacket] on success, or null on failure.
+  /// Parses a raw AX.25 byte frame into an APRS packet.
   static AprsPacket? parse(Uint8List frame) {
-    if (frame.length < 16) {
-      // Minimum length for dest, src, and control fields
-      return null;
-    }
+    if (frame.length < 16) return null;
 
     try {
-      // AX.25 addresses are 7 bytes each: 6 for callsign, 1 for SSID
-      String destination = _parseAddress(frame.sublist(0, 7));
-      String source = _parseAddress(frame.sublist(7, 14));
+      Ax25Address destination = _parseAddress(frame.sublist(0, 7));
+      Ax25Address source = _parseAddress(frame.sublist(7, 14));
 
-      List<String> path = [];
+      List<Ax25Address> path = [];
       int pathEndIndex = 14;
 
-      // Loop through path digipeaters until we find the end of the address field
       for (int i = 14; i < frame.length - 7; i += 7) {
+        path.add(_parseAddress(frame.sublist(i, i + 7)));
         // The last address byte has its least significant bit set to 1
         if ((frame[i + 6] & 0x01) == 0x01) {
-          path.add(_parseAddress(frame.sublist(i, i + 7)));
           pathEndIndex = i + 7;
           break;
-        } else {
-          path.add(_parseAddress(frame.sublist(i, i + 7)));
         }
       }
 
-      // Find the payload start, which is after Control (0x03) and PID (0xF0)
-      if (pathEndIndex + 2 >= frame.length ||
+      // Check for Control (0x03) and PID (0xF0)
+      if (pathEndIndex + 2 > frame.length ||
           frame[pathEndIndex] != 0x03 ||
           frame[pathEndIndex + 1] != 0xF0) {
         return null; // Not a UI frame
@@ -70,22 +95,70 @@ class AprsParser {
         destination: destination,
         path: path,
         payload: payload.trim(),
+        originalFrame: frame,
       );
     } catch (e) {
-      // Catch any potential range errors or decoding issues
       return null;
     }
   }
 
-  /// Decodes a 7-byte AX.25 address field into a callsign-SSID string.
-  static String _parseAddress(Uint8List addressBytes) {
-    // Callsigns are stored as 6 ASCII chars, shifted left by 1 bit.
+  /// Decodes a 7-byte AX.25 address field.
+  static Ax25Address _parseAddress(Uint8List addressBytes) {
     String callsign =
         ascii.decode(addressBytes.sublist(0, 6).map((b) => b >> 1).toList()).trim();
-
-    // The SSID is encoded in the 7th byte.
     int ssid = (addressBytes[6] >> 1) & 0x0F;
+    bool hasBeenDigipeated = (addressBytes[6] & 0x80) == 0x80;
 
-    return ssid > 0 ? '$callsign-$ssid' : callsign;
+    return Ax25Address(
+      callsign: callsign,
+      ssid: ssid,
+      hasBeenDigipeated: hasBeenDigipeated,
+    );
+  }
+
+  /// Encodes an AprsPacket back into a raw AX.25 frame.
+  static Uint8List encode(AprsPacket packet) {
+    List<int> frame = [];
+
+    // Add addresses
+    frame.addAll(_encodeAddress(packet.destination));
+    frame.addAll(_encodeAddress(packet.source));
+
+    for (int i = 0; i < packet.path.length; i++) {
+      bool isLast = i == packet.path.length - 1;
+      frame.addAll(_encodeAddress(packet.path[i], lastAddress: isLast));
+    }
+
+    // Add Control (0x03) and PID (0xF0)
+    frame.add(0x03);
+    frame.add(0xF0);
+
+    // Add Payload
+    frame.addAll(utf8.encode(packet.payload));
+
+    return Uint8List.fromList(frame);
+  }
+
+  /// Encodes a callsign-SSID string into a 7-byte AX.25 address field.
+  static Uint8List _encodeAddress(Ax25Address address, {bool lastAddress = false}) {
+    Uint8List bytes = Uint8List(7);
+    String call = address.callsign.toUpperCase().padRight(6, ' ');
+
+    // Encode 6-char callsign, shifted left by 1 bit
+    for (int i = 0; i < 6; i++) {
+      bytes[i] = ascii.encode(call[i])[0] << 1;
+    }
+
+    // Encode SSID byte
+    int ssidByte = 0;
+    ssidByte |= (address.ssid & 0x0F) << 1; // SSID
+    ssidByte |= (address.hasBeenDigipeated ? 0x80 : 0x00); // H-bit
+    ssidByte |= 0x60; // Reserved bits, standard for UI frames
+    if (lastAddress) {
+      ssidByte |= 0x01; // End of address list bit
+    }
+    bytes[6] = ssidByte;
+
+    return bytes;
   }
 }

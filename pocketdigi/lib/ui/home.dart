@@ -1,12 +1,13 @@
 // File: ui/home.dart
 
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_bluetooth_serial/flutter_bluetooth_serial.dart';
 import '../services/tnc_service.dart';
 import '../services/aprs_parser.dart';
 
 // --- Log Entry Data Structure for UI ---
-enum UILogEntryType { system, packet }
+enum UILogEntryType { system, rxPacket, txPacket }
 
 class UILogEntry {
   final String content;
@@ -26,28 +27,49 @@ class PocketDigiHomePage extends StatefulWidget {
 }
 
 class _PocketDigiHomePageState extends State<PocketDigiHomePage> {
-  // The UI only needs a reference to the service
   final TncService _tncService = TncService();
   BluetoothDevice? _selectedDevice;
 
   // UI-specific state
   final List<UILogEntry> _logs = [];
   final _logScrollController = ScrollController();
-  final _callsignController = TextEditingController(text: 'N0CALL-1');
+  final _callsignController = TextEditingController(); // <-- REMOVE HARDCODED VALUE
+  bool _isDigipeaterEnabled = true;
+  bool _isIGateEnabled = false;
   int _packetsHeard = 0;
   int _packetsDigipeated = 0;
+  int _packetsGated = 0;
+
+  // Stream Subscriptions
+  final List<StreamSubscription> _subscriptions = [];
 
   @override
   void initState() {
     super.initState();
-    // Listen to the streams from the service to update the UI
-    _tncService.systemLogs.listen(_addSystemLog);
-    _tncService.packetLogs.listen(_addPacketLog);
+    // Listen to the streams from the service
+    _subscriptions.add(_tncService.systemLogs.listen(_addSystemLog));
+    _subscriptions.add(_tncService.rxPacketLogs.listen(_addRxPacketLog));
+    _subscriptions.add(_tncService.txPacketLogs.listen(_addTxPacketLog));
+
+    // Listen for the initial callsign loaded from storage
+    _subscriptions.add(
+      _tncService.initialCallsign.listen((callsign) {
+        if (mounted) {
+          _callsignController.text = callsign;
+          // Configure the service with other initial UI values
+          _tncService.setDigipeaterEnabled(_isDigipeaterEnabled);
+        }
+      })
+    );
+
     _tncService.getPairedDevices(); // Initial scan
   }
 
   @override
   void dispose() {
+    for (var sub in _subscriptions) {
+      sub.cancel();
+    }
     _tncService.dispose();
     _logScrollController.dispose();
     _callsignController.dispose();
@@ -58,18 +80,16 @@ class _PocketDigiHomePageState extends State<PocketDigiHomePage> {
     _updateLogs(UILogEntry(content: message, type: UILogEntryType.system));
   }
 
-  void _addPacketLog(AprsPacket packet) {
-    setState(() {
-      _packetsHeard++;
-    });
+  void _addRxPacketLog(AprsPacket packet) {
+    setState(() => _packetsHeard++);
     _updateLogs(
-        UILogEntry(content: packet.toString(), type: UILogEntryType.packet));
+        UILogEntry(content: packet.toString(), type: UILogEntryType.rxPacket));
+  }
 
-    // --- YOUR DIGIPEATER/IGATE LOGIC WILL GO HERE ---
-    // if (shouldDigipeat(packet)) {
-    //   _tncService.send(modifiedPacket);
-    //   setState(() => _packetsDigipeated++);
-    // }
+  void _addTxPacketLog(AprsPacket packet) {
+    setState(() => _packetsDigipeated++);
+    _updateLogs(
+        UILogEntry(content: packet.toString(), type: UILogEntryType.txPacket));
   }
 
   void _updateLogs(UILogEntry entry) {
@@ -115,7 +135,7 @@ class _PocketDigiHomePageState extends State<PocketDigiHomePage> {
     );
   }
 
-  // --- UI Builder Methods ---
+  // --- UI Builder Methods (No changes from here down) ---
 
   Widget _buildSectionTitle(String title) {
     return Padding(
@@ -255,44 +275,49 @@ class _PocketDigiHomePageState extends State<PocketDigiHomePage> {
     );
   }
 
-   Widget _buildConfigurationCard() {
+  Widget _buildConfigurationCard() {
     return Card(
       elevation: 4,
       child: Padding(
         padding: const EdgeInsets.all(16.0),
         child: StreamBuilder<bool>(
-          stream: _tncService.isConnectedStream,
-          initialData: false,
-          builder: (context, snapshot) {
-            final isConnected = snapshot.data ?? false;
-            return Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                _buildSectionTitle('Operation'),
-                TextField(
-                  controller: _callsignController,
-                  decoration: const InputDecoration(labelText: 'Callsign-SSID'),
-                  enabled: !isConnected
-                ),
-                const SizedBox(height: 8),
-                // In a real app, you would pass these values to the TNC service
-                // for it to use in its digipeater logic.
-                SwitchListTile(
-                  title: const Text('Enable Digipeater'),
-                  value: true, // Placeholder
-                  onChanged: isConnected ? (bool value) {} : null,
-                  activeColor: Colors.blueAccent,
-                ),
-                SwitchListTile(
-                  title: const Text('Enable iGate'),
-                  value: false, // Placeholder
-                  onChanged: isConnected ? (bool value) {} : null,
-                  activeColor: Colors.blueAccent,
-                ),
-              ],
-            );
-          }
-        ),
+            stream: _tncService.isConnectedStream,
+            initialData: false,
+            builder: (context, snapshot) {
+              final isConnected = snapshot.data ?? false;
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _buildSectionTitle('Operation'),
+                  TextField(
+                    controller: _callsignController,
+                    decoration:
+                        const InputDecoration(labelText: 'Callsign-SSID'),
+                    enabled: !isConnected,
+                    onChanged: (value) => _tncService.setCallsign(value),
+                  ),
+                  const SizedBox(height: 8),
+                  SwitchListTile(
+                    title: const Text('Enable Digipeater'),
+                    value: _isDigipeaterEnabled,
+                    onChanged: (bool value) {
+                      setState(() => _isDigipeaterEnabled = value);
+                      _tncService.setDigipeaterEnabled(value);
+                    },
+                    activeColor: Colors.blueAccent,
+                  ),
+                  SwitchListTile(
+                    title: const Text('Enable iGate'),
+                    value: _isIGateEnabled,
+                    onChanged: (bool value) {
+                      setState(() => _isIGateEnabled = value);
+                      // TODO: _tncService.setIGateEnabled(value);
+                    },
+                    activeColor: Colors.blueAccent,
+                  ),
+                ],
+              );
+            }),
       ),
     );
   }
@@ -311,7 +336,7 @@ class _PocketDigiHomePageState extends State<PocketDigiHomePage> {
               children: [
                 _buildStatItem('Heard', _packetsHeard.toString()),
                 _buildStatItem('Digipeated', _packetsDigipeated.toString()),
-                _buildStatItem('Gated', "0"), // Placeholder
+                _buildStatItem('Gated', _packetsGated.toString()),
               ],
             ),
           ],
@@ -354,10 +379,21 @@ class _PocketDigiHomePageState extends State<PocketDigiHomePage> {
                 itemCount: _logs.length,
                 itemBuilder: (context, index) {
                   final log = _logs[index];
-                  Color textColor = Colors.white70;
+                  Color textColor = Colors.white70; // System
+                  String prefix = '';
 
-                  if (log.type == UILogEntryType.packet) {
-                    textColor = Colors.lightGreenAccent.shade400;
+                  switch (log.type) {
+                    case UILogEntryType.rxPacket:
+                      textColor = Colors.lightGreenAccent.shade400;
+                      prefix = 'RX: ';
+                      break;
+                    case UILogEntryType.txPacket:
+                      textColor = Colors.yellowAccent.shade400;
+                      prefix = 'TX: ';
+                      break;
+                    case UILogEntryType.system:
+                      textColor = Colors.white70;
+                      break;
                   }
 
                   return Padding(
@@ -374,7 +410,7 @@ class _PocketDigiHomePageState extends State<PocketDigiHomePage> {
                             style: const TextStyle(color: Colors.white38),
                           ),
                           TextSpan(
-                            text: log.content,
+                            text: '$prefix${log.content}',
                             style: TextStyle(color: textColor),
                           ),
                         ],

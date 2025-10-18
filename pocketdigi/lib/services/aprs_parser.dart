@@ -223,10 +223,9 @@ class AprsParser {
     String lat = _formatLatitude(latitude);
     String lon = _formatLongitude(longitude);
 
-    // 'I' is the symbol table ID (overlay)
-    // '#' is the symbol code (Digi, from the alternate table)
+
     // Use ${lon} to separate the variable from the 'I#' string
-    String payload = '!$lat/${lon}I#$comment'; // <-- BUG FIX HERE
+    String payload = '!$lat/${lon}#/$comment'; // <-- BUG FIX HERE
 
     return AprsPacket(
       source: Ax25Address.fromString(callsignSsid),

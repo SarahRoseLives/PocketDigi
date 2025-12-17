@@ -8,6 +8,7 @@ import 'package:permission_handler/permission_handler.dart';
 import '../services/tnc_service.dart';
 import '../services/aprs_is_service.dart';
 import '../services/aprs_parser.dart';
+import '../services/maidenhead_converter.dart'; // Import the new helper
 
 // --- Log Entry Data Structure for UI ---
 enum UILogEntryType { system, rxPacket, txPacket }
@@ -42,14 +43,21 @@ class _PocketDigiHomePageState extends State<PocketDigiHomePage> {
   final List<UILogEntry> _logs = [];
   final _logScrollController = ScrollController();
   final _callsignController = TextEditingController();
+  final _gridController = TextEditingController(); // NEW: Grid Input
+
   bool _isDigipeaterEnabled = true;
   bool _isIGateEnabled = false;
+
+  // NEW: Location Toggle State
+  bool _useGps = true;
+  StreamSubscription<Position>? _gpsSubscription;
+
   int _packetsHeard = 0;
   int _packetsDigipeated = 0;
   int _packetsGated = 0;
   int _packetsBeaconed = 0;
   Timer? _beaconTimer;
-  Position? _currentPosition; // Store current location
+  Position? _currentPosition;
 
   final List<StreamSubscription> _subscriptions = [];
 
@@ -71,8 +79,8 @@ class _PocketDigiHomePageState extends State<PocketDigiHomePage> {
       }),
     );
 
-    _tncService.getPairedDevices();
-    _initLocation(); // Get location on startup
+    // Initialize Permissions and Location
+    _initPermissions();
   }
 
   @override
@@ -80,39 +88,102 @@ class _PocketDigiHomePageState extends State<PocketDigiHomePage> {
     for (var sub in _subscriptions) {
       sub.cancel();
     }
+    _gpsSubscription?.cancel();
     _beaconTimer?.cancel();
     _tncService.dispose();
     _aprsIsService.dispose();
     _logScrollController.dispose();
     _callsignController.dispose();
+    _gridController.dispose();
     super.dispose();
   }
 
-  // --- Location & Beacon Logic ---
-  Future<void> _initLocation() async {
-    var status = await Permission.location.request();
-    if (!status.isGranted) {
-       _addSystemLog('Location permission denied.');
-       return;
+  // --- Location & Permissions Logic ---
+  Future<void> _initPermissions() async {
+    // Request multiple permissions at once
+    Map<Permission, PermissionStatus> statuses = await [
+      Permission.location,
+      Permission.bluetoothScan,
+      Permission.bluetoothConnect,
+    ].request();
+
+    bool locGranted = statuses[Permission.location]!.isGranted;
+    bool btConnectGranted = statuses[Permission.bluetoothConnect]!.isGranted;
+
+    if (locGranted) {
+      _addSystemLog('Location permission granted.');
+      if (_useGps) _startGps();
+    } else {
+      _addSystemLog('Location permission denied. Switching to Manual Grid.');
+      setState(() => _useGps = false);
     }
 
-    _addSystemLog('Location permission granted. Getting position...');
-    try {
-      // Get an initial position
-      _currentPosition = await Geolocator.getCurrentPosition(
-          desiredAccuracy: LocationAccuracy.medium);
-      _addSystemLog('Initial position acquired: ${_currentPosition!.latitude}, ${_currentPosition!.longitude}');
-
-      // Also start listening for location changes
-      Geolocator.getPositionStream().listen((Position position) {
-        _currentPosition = position;
-      });
-
-    } catch (e) {
-       _addSystemLog('Could not get initial position: $e');
+    if (btConnectGranted) {
+      _addSystemLog('Bluetooth permissions granted.');
+      _tncService.getPairedDevices();
+    } else {
+      _addSystemLog('Bluetooth permissions denied. TNC will not work.');
     }
   }
 
+  void _startGps() async {
+    _gpsSubscription?.cancel();
+    _addSystemLog('Starting GPS listener...');
+
+    try {
+      // Get initial fix
+      Position pos = await Geolocator.getCurrentPosition(
+          desiredAccuracy: LocationAccuracy.medium);
+      _updatePosition(pos);
+
+      // Listen for updates
+      _gpsSubscription = Geolocator.getPositionStream(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.medium,
+          distanceFilter: 100, // Update every 100 meters
+        ),
+      ).listen((Position position) {
+        _updatePosition(position);
+      });
+    } catch (e) {
+      _addSystemLog('GPS Error: $e');
+    }
+  }
+
+  void _stopGps() {
+    _gpsSubscription?.cancel();
+    _gpsSubscription = null;
+    _addSystemLog('GPS stopped. Using manual location.');
+  }
+
+  void _updatePosition(Position pos) {
+    setState(() => _currentPosition = pos);
+    // Optional: Reverse calculate Grid Square from Lat/Lon could go here for UI nicety
+  }
+
+  // Calculate position from Manual Grid Input
+  void _updatePositionFromGrid(String grid) {
+    var coords = MaidenheadConverter.gridToLatLong(grid);
+    if (coords != null) {
+      setState(() {
+        _currentPosition = Position(
+          longitude: coords['longitude']!,
+          latitude: coords['latitude']!,
+          timestamp: DateTime.now(),
+          accuracy: 0,
+          altitude: 0,
+          heading: 0,
+          speed: 0,
+          speedAccuracy: 0,
+          altitudeAccuracy: 0,
+          headingAccuracy: 0,
+        );
+      });
+      _addSystemLog('Location set to Grid $grid (${coords['latitude']!.toStringAsFixed(4)}, ${coords['longitude']!.toStringAsFixed(4)})');
+    }
+  }
+
+  // --- Beacon Logic ---
   void _startBeacons() {
     _beaconTimer?.cancel();
     _beaconTimer = Timer.periodic(const Duration(minutes: 10), (timer) {
@@ -156,15 +227,11 @@ class _PocketDigiHomePageState extends State<PocketDigiHomePage> {
     _updateLogs(UILogEntry(content: message, type: UILogEntryType.system));
   }
 
-  /// Handles a packet received from RF (TNC)
   void _onRxPacket(AprsPacket packet) {
     setState(() => _packetsHeard++);
     _updateLogs(UILogEntry(content: packet.toString(), type: UILogEntryType.rxPacket));
 
-    // RF-to-IS: Gate the packet to the internet if iGate is on
     if (_isIGateEnabled) {
-      // CRITICAL: Prevent IS-to-IS loops. Do not gate packets that originated from IS.
-      // These are typically identified by a "qAR" or "qAO" in the path.
       bool fromIS = packet.path.any((hop) => hop.callsign.startsWith('qA'));
       if (!fromIS) {
         _aprsIsService.sendPacket(packet.toString());
@@ -172,12 +239,9 @@ class _PocketDigiHomePageState extends State<PocketDigiHomePage> {
     }
   }
 
-  /// Handles a packet received from IS (Internet)
   void _onIsPacket(String packetString) {
-    // IS-to-RF: Gate the packet to the radio
     AprsPacket? packet = AprsParser.parseFromString(packetString);
     if (packet != null) {
-      // Prevent gating our own beacons back to RF
       if (packet.source.callsign == _callsignController.text.split('-')[0]) {
         return;
       }
@@ -185,7 +249,6 @@ class _PocketDigiHomePageState extends State<PocketDigiHomePage> {
     }
   }
 
-  /// Handles logging for *any* transmitted packet
   void _onTxPacket(TransmittedPacket tx) {
     setState(() {
       switch (tx.source) {
@@ -234,16 +297,11 @@ class _PocketDigiHomePageState extends State<PocketDigiHomePage> {
       }
 
       if (_currentPosition == null) {
-         _addSystemLog('Error: No location. Trying to get one...');
-         await _initLocation(); // Try again to get location
-         if (_currentPosition == null) {
-           _addSystemLog('Error: Cannot enable iGate without location.');
-           setState(() => _isIGateEnabled = false);
-           return;
-         }
+          _addSystemLog('Error: No location set (GPS or Manual).');
+          setState(() => _isIGateEnabled = false);
+          return;
       }
 
-      // Now we connect with a valid location
       _aprsIsService.connect(
         callsign: _callsignController.text,
         latitude: _currentPosition!.latitude,
@@ -261,7 +319,7 @@ class _PocketDigiHomePageState extends State<PocketDigiHomePage> {
     } else {
       if (_selectedDevice == null) return;
       _tncService.connect(_selectedDevice!);
-      _startBeacons(); // Start beacons once connected to TNC
+      _startBeacons();
     }
   }
 
@@ -441,6 +499,8 @@ class _PocketDigiHomePageState extends State<PocketDigiHomePage> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   _buildSectionTitle('Operation'),
+
+                  // Callsign Input
                   TextField(
                     controller: _callsignController,
                     decoration:
@@ -448,7 +508,55 @@ class _PocketDigiHomePageState extends State<PocketDigiHomePage> {
                     enabled: !isConnected && !_isIGateEnabled,
                     onChanged: (value) => _tncService.setCallsign(value),
                   ),
+                  const SizedBox(height: 16),
+
+                  // Location Toggle
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Text('Location Source:', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                      ToggleButtons(
+                        isSelected: [_useGps, !_useGps],
+                        onPressed: (int index) {
+                           setState(() {
+                             _useGps = index == 0;
+                           });
+                           if (_useGps) {
+                             _startGps();
+                           } else {
+                             _stopGps();
+                           }
+                        },
+                        borderRadius: BorderRadius.circular(8),
+                        children: const [
+                          Padding(padding: EdgeInsets.symmetric(horizontal: 12), child: Text("GPS")),
+                          Padding(padding: EdgeInsets.symmetric(horizontal: 12), child: Text("Manual")),
+                        ],
+                      ),
+                    ],
+                  ),
+
+                  // Manual Grid Input (Only shows if GPS is off)
+                  if (!_useGps) ...[
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: _gridController,
+                      decoration: const InputDecoration(
+                        labelText: 'Maidenhead Grid (e.g., EM79)',
+                        prefixIcon: Icon(Icons.grid_3x3),
+                      ),
+                      textCapitalization: TextCapitalization.characters,
+                      onChanged: (value) {
+                        if (value.length >= 4) {
+                          _updatePositionFromGrid(value);
+                        }
+                      },
+                    ),
+                  ],
+
                   const SizedBox(height: 8),
+
+                  // Toggles
                   SwitchListTile(
                     title: const Text('Enable Digipeater'),
                     value: _isDigipeaterEnabled,
@@ -461,8 +569,6 @@ class _PocketDigiHomePageState extends State<PocketDigiHomePage> {
                   SwitchListTile(
                     title: const Text('Enable iGate'),
                     value: _isIGateEnabled,
-                    // You can't toggle iGate while connected to the TNC
-                    // to prevent callsign/filter mismatches.
                     onChanged: isConnected ? null : _onToggleIGate,
                     activeColor: Colors.blueAccent,
                   ),
